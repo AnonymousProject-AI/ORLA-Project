@@ -35,7 +35,7 @@ flwr run --run-config "num-server-rounds=5 fraction-fit=0.1"
 ```
 
 > \[!TIP\]
-> For a more detailed walk-through check our [quickstart Transformers tutorial](https://flower.ai/docs/framework/tutorial-quickstart-huggingface.html)
+> For a more detailed walk-through check [quickstart Transformers tutorial](https://flower.ai/docs/framework/tutorial-quickstart-huggingface.html)
 
 ### Run with the Deployment Engine
 
