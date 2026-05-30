@@ -21,7 +21,9 @@ dependencies = [
     "torch==2.4.0",
     "transformers>=4.30.0,<5.0",
     "evaluate>=0.4.0,<1.0",
-    "datasets>=2.0.0, <3.0",
+    "datasets==2.14.6",
+    "pyarrow==19.0.1",
+    "numpy==1.26.4",
     "scikit-learn>=1.3.1, <2.0",
 ]
 
@@ -51,30 +53,68 @@ clientapp = "LoRA_Sec.client_app:app"
 num-server-rounds = 200
 
 fraction-fit =  0.8
+
 fraction-evaluate = 1
+eval_window_rounds = 200     
+eval_last_k_in_window = 11    
+
 number_of_clients = 20
 
 # ----------------- Orthogonality Regularization ----------------- #
 
-use_ortho_loss = true
-lambda_ortho = 0.4
+use_ortho_loss = false
+lambda_ortho = 0             # for seq_cls: 0.4   ,  for mc_qa: 0.02
 
 # ======================================================================================================= # 
 # ============================================ Dataset and Model ======================================== #
 
+# ----------------------------------------------------------------- #
+# -------------------- Config for SWAG dataset -------------------- #
+
+# partitioner_type = "Dirichlet"     
+# partitioner_parameter = 0.5             # 0 if partitioner does not have parameter  -  0.5
+
+# problem_type = "mc_qa"                  # "seq_cls"  (Text Classification)  , "mc_qa" (Multiple Choice Question Answering)
+# dataset_name = "SWAG"           
+# num_labels = 0                          # IMDB=2 ,  Yelp=5 , DBPedia=14  ----    SQuADv1.1/HotpotQA= N/A
+# number_of_samples = 10000               # 0 or negative => use full dataset  -- classification: 10000  --- PIQA: 10000  ---  SWAG: 10000 
+# learning_rate = 1e-5                    # 5e-5 for IMDB, Yelp, DBpedia  ---  PIQA: 4e-4 ---  SWAG: 1e-5 
+
+# model-name = "google/electra-small-discriminator"        #  "prajjwal1/bert-tiny"  ,  "google/electra-small-discriminator" 
+
+# ----------------------------------------------------------------- #
+# --------------------- Config for PIQA dataset ------------------- #
+
 partitioner_type = "Dirichlet"     
-partitioner_parameter = 0.5             # 0 if partitioner does not have parameter
+partitioner_parameter = 0.5               # 0 if partitioner does not have parameter  -  0.5
 
-dataset_name = "IMDB"                   # "IMDB", "Yelp" , "DBPedia"
-num_labels = 2                          #  IMDB=2 ,  Yelp=5 , DBPedia=14, 
-number_of_samples = 10000               # 0 or negative => use full dataset
+problem_type = "mc_qa"                    # "seq_cls"  (Text Classification)  , "mc_qa" (Multiple Choice Question Answering)
+dataset_name = "PIQA"                    
+num_labels = 0                            # IMDB=2 ,  Yelp=5 , DBPedia=14  ----    SQuADv1.1/HotpotQA= N/A
+number_of_samples = 10000                 # 0 or negative => use full dataset  -- classification: 10000  --- PIQA: 10000  ---  SWAG: 10000
+learning_rate = 4e-4                      # 5e-5 for IMDB, Yelp, DBpedia  ---  PIQA: 4e-4 ---  SWAG: 1e-5 
 
-model-name =  "prajjwal1/bert-tiny"  
+model-name = "google/electra-small-discriminator"        #  "prajjwal1/bert-tiny"  ,  "google/electra-small-discriminator" 
+
+# ----------------------------------------------------------------- #
+# ------------ Config for IMDB , Yelp , DBPedia datasets ---------- #
+
+# partitioner_type = "Dirichlet"     
+# partitioner_parameter = 0.5             # 0 if partitioner does not have parameter  -  0.5
+
+# problem_type = "seq_cls"                # "seq_cls"  (Text Classification)  , "mc_qa" (Multiple Choice Question Answering)
+# dataset_name = "IMDB"                   # "IMDB", "Yelp" , "DBPedia" 
+# num_labels = 2                          # IMDB=2 ,  Yelp=5 , DBPedia=14  ----    SQuADv1.1/HotpotQA= N/A
+# number_of_samples = 10000               # 0 or negative => use full dataset  -- classification: 10000  --- PIQA: 10000  ---  SWAG: 10000
+# learning_rate = 5e-5                    # 5e-5 for IMDB, Yelp, DBpedia  ---  PIQA: 4e-4 ---  SWAG: 1e-5 
+
+# model-name = "prajjwal1/bert-tiny"      #  "prajjwal1/bert-tiny"  ,  "google/electra-small-discriminator" 
+
 
 # ======================================================================================================= # 
 # ============================================== Attack Config ========================================== #
 
-attack_type = "RandScaling"             # RandScaling, MinMax, MinSum, Trim, PoisonedFL, FedIMP, Mixture
+attack_type = "Mixture"                   # RandScaling, MinMax, MinSum, Trim, PoisonedFL, FedIMP, Mixture,
 Malicious-Client-Percentage = 0.4                  
 
 # ------------------------------------------------------------------ #
@@ -119,12 +159,12 @@ mixture_seed = 1337
 # ======================================================================================================= # 
 # ============================================== Defense Config ========================================= # newFedAvg
 
-strategy = "MultiKrum"              #  FedAvg, Krum, MultiKrum, TrimmedMean, FLTrust, DnC, FoolsGold, FedDMC, ShieldFL, ORLA, ORLA-Flex  
+strategy = "FedAvg"                 # FedAvg, Krum, MultiKrum, TrimmedMean, FLTrust, DnC, FedDMC, ShieldFL, ORLA, ORLA-Flex  
 
-strategy_parameter = 6              # FedAvg: -
+strategy_parameter = 0.4            # FedAvg: -
                                     # Krum: 0.4          (trim_ratio)
                                     # MultiKrum: 6       ("m" ratio of clients as winners)
-                                    # TrimmedMean: 0.2   (Top and bottom trim_ratio) 
+                                    # TrimmedMean: 0.4   (Top and bottom trim_ratio) 
                                     # FLTrust: -
                                     # DnC: 0.4           (trim_ratio)  
                                     # FoolsGold: 1       (κ: confidence for the logit)
@@ -162,6 +202,6 @@ options.num-supernodes = 20
 [tool.flwr.federations.local-simulation-gpu]
 options.num-supernodes = 20  
 options.backend.client-resources.num-cpus = 4      # each ClientApp assumes to use 4CPUs
-options.backend.client-resources.num-gpus = 0.25   # at most 4 ClientApp will run in a given GPU (lower it to increase parallelism)
+options.backend.client-resources.num-gpus = 0.5   # at most 4 ClientApp will run in a given GPU (lower it to increase parallelism)
 
 # ======================================================================================================= #
