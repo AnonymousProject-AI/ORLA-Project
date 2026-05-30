@@ -10,6 +10,7 @@ from flwr.common import Context
 from LoRA_Sec.task import (
     train,
     test,
+    test_qa,
     load_data,
     set_params,
     get_params,
@@ -191,11 +192,12 @@ def fedimp_acceptance_metrics(flat_updates, n_total, m_compromised_guess=0):
 # ====================================================================================================================================================== #
 
 class ClientClass(NumPyClient):
-    def __init__(self, model_name, trainloader, testloader, cid, context , use_ortho_loss, is_malicious=False) -> None:
+    def __init__(self, model_name, trainloader, testloader, cid, context , use_ortho_loss, lr, is_malicious=False) -> None:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.trainloader = trainloader
         self.testloader = testloader
-        self.net = get_model(model_name, num_labels = int(context.run_config["num_labels"]))
+        self.problem_type = str(context.run_config.get("problem_type", "seq_cls")).lower()
+        self.net = get_model(model_name, num_labels = int(context.run_config.get("num_labels")), problem_type=self.problem_type)
         self.net.to(self.device)
         self.is_malicious = is_malicious
         self.poison_intensity: float = 0.35
@@ -204,6 +206,7 @@ class ClientClass(NumPyClient):
         self.attack_type = context.run_config["attack_type"]   
         self.use_ortho_loss = use_ortho_loss
         self.lambda_ortho = context.run_config["lambda_ortho"]
+        self.lr = lr
 
         # --- Mixture config (used when attack_type == "Mixture") ---
         _mix_default = ["RandScaling", "Trim", "MinMax", "MinSum", "PoisonedFL", "FedIMP"]
@@ -271,7 +274,8 @@ class ClientClass(NumPyClient):
         # Only for MinMax and MinSum attacks ------------------------
         set_params(self.net, parameters)  # Load server model
 
-        broadcast_params = get_params(self.net)    # snapshot of the broadcast/global (wRe)
+        # broadcast_params = get_params(self.net)    # snapshot of the broadcast/global (wRe)
+        broadcast_params = old_params  # or broadcast_params = parameters
 
         global global_benign_grads                 # needed to mutate it from inside the function
 
@@ -287,12 +291,13 @@ class ClientClass(NumPyClient):
         benign_grads = global_benign_grads
 
         # Set both model and LoRA parameters
-        set_params(self.net, parameters)
+        # set_params(self.net, parameters)
 
-        train(self.net, self.trainloader, epochs=1, device=self.device, use_ortho_loss=self.use_ortho_loss, lambda_ortho=self.lambda_ortho)
+        train(self.net, self.trainloader, self.lr , epochs=1, device=self.device, use_ortho_loss=self.use_ortho_loss, lambda_ortho=self.lambda_ortho)
+        # train(self.net, self.trainloader, 1, self.device, self.use_ortho_loss, self.lambda_ortho, self.lr)
 
-        before_attack_local = get_params(self.net)  # snapshot after local training, pre-attack
-
+        # before_attack_local = get_params(self.net)  # snapshot after local training, pre-attack
+        before_attack_local = None  # only compute if an attack needs it
 
         # -------------------- For Mixture attack -------------------- #
 
@@ -311,6 +316,9 @@ class ClientClass(NumPyClient):
 
 
             elif selected_attack == "Trim":
+
+                if before_attack_local is None:
+                    before_attack_local = get_params(self.net)  # snapshot after local training, pre-attack
 
                 # compute mu, sigma (either via coordination A.2 or fallback B)
                 mu, sigma, s_hat = self._compute_trim_stats_partial(
@@ -498,7 +506,7 @@ class ClientClass(NumPyClient):
                 benign_deltas = []
                 for _ in range(max(1, self.fedimp_num_sims)):
                     batches = self._fedimp_take_batches(self.fedimp_sim_batches)
-                    d = self._fedimp_train_k_batches(broadcast_params, batches)
+                    d = self._fedimp_train_k_batches(broadcast_params, batches, self.lr)
                     benign_deltas.append(d.unsqueeze(0))
                 benign_deltas = torch.cat(benign_deltas, dim=0)
 
@@ -657,6 +665,12 @@ class ClientClass(NumPyClient):
     def evaluate(self, parameters, config) -> tuple[float, int, dict]:
         """Evaluate model parameters."""
         set_params(self.net, parameters)
+        if self.problem_type == "qa":
+            loss, exact_match, f1 = test_qa(self.net, self.testloader, device=self.device)
+            return float(loss), len(self.testloader.dataset), {"exact_match": float(exact_match), "f1": float(f1)}
+        if self.problem_type == "mc_qa":
+            loss, accuracy = test(self.net, self.testloader, device=self.device)
+            return float(loss), len(self.testloader.dataset), {"loss": float(loss), "accuracy": float(accuracy)}
         loss, accuracy = test(self.net, self.testloader, device=self.device)
         # return float(loss), len(self.testloader), {"accuracy": float(accuracy)}
         return float(loss), len(self.testloader), {"loss": float(loss), "accuracy": float(accuracy)}
@@ -825,13 +839,14 @@ class ClientClass(NumPyClient):
         return mu, sigma, mask
 
 
-    def _fedimp_train_k_batches(self, starting_params, batches: list):
+    # def _fedimp_train_k_batches(self, starting_params, batches: list):
+    def _fedimp_train_k_batches(self, starting_params, batches: list, lr):
         """Do a tiny benign step from broadcast to mimic a benign client."""
         device = next(self.net.parameters()).device
         # reset to broadcast
         set_params(self.net, starting_params)
         self.net.train()
-        opt = AdamW((p for p in self.net.parameters() if p.requires_grad), lr=5e-5)
+        opt = AdamW((p for p in self.net.parameters() if p.requires_grad), lr=lr)
         for batch in batches:
             batch = {k: v.to(device) for k, v in batch.items()}
             out = self.net(**batch)
@@ -866,7 +881,7 @@ class ClientClass(NumPyClient):
             batches = self._fedimp_take_batches(batches_per_sim)
             if not batches:
                 break
-            d = self._fedimp_train_k_batches(starting_params, batches)
+            d = self._fedimp_train_k_batches(starting_params, batches, self.lr)
             deltas.append(d.unsqueeze(0))
         if not deltas:
             return None, None
@@ -1121,12 +1136,14 @@ def client_fn(context: Context) -> Client:
     partitioner_parameter = context.run_config["partitioner_parameter"]
     dataset_name = context.run_config["dataset_name"]
     use_ortho_loss = context.run_config["use_ortho_loss"]
+    lr = context.run_config["learning_rate"]
 
     # Read the run config to get settings to configure the Client
     model_name = context.run_config["model-name"]
 
     number_of_samples = int(context.run_config.get("number_of_samples", 0))
-    trainloader, testloader = load_data(partition_id, num_partitions, model_name, partitioner_type, dataset_name, partitioner_parameter, number_of_samples)
+    problem_type = str(context.run_config.get("problem_type", "seq_cls")).lower()
+    trainloader, testloader = load_data(partition_id, num_partitions, model_name, partitioner_type, dataset_name, partitioner_parameter, number_of_samples, problem_type=problem_type)
 
     # ---------------------------------------------------------------------
     # ---------------------- Select Malacious Clients ---------------------
@@ -1165,7 +1182,7 @@ def client_fn(context: Context) -> Client:
 
     # ----------------------------------------------------------------------
 
-    return ClientClass(model_name, trainloader, testloader, is_malicious=is_malicious, cid=cid, use_ortho_loss=use_ortho_loss, context=context).to_client()
+    return ClientClass(model_name, trainloader, testloader, is_malicious=is_malicious, cid=cid, use_ortho_loss=use_ortho_loss, lr=lr, context=context).to_client()
 
 # ====================================================================================================================================================== #
 

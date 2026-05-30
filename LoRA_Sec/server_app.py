@@ -4,14 +4,22 @@ from flwr.common import Context, ndarrays_to_parameters, EvaluateIns, parameters
 from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from flwr.server.strategy import Krum
 from flwr.common.typing import FitRes, Parameters, Scalar
-from typing import List, Tuple, Optional, Dict  
+from typing import List, Tuple, Optional, Dict
 import random
 import math
 import numpy as np
 from flwr.server.client_proxy import ClientProxy
 from flwr.common import FitIns
 
-from LoRA_Sec.task import get_params, get_model, set_params
+from LoRA_Sec.task import get_params, get_model, set_params, _get_newsqa_train_dataset, _get_seqcls_train_dataset
+
+# -------------------- Problem switch (seq_cls vs extractive QA) --------------------
+PROBLEM_TYPE = "seq_cls"
+
+def get_model_pt(model_name, num_labels):
+    """Route model construction based on run_config['problem_type']."""
+    return get_model(model_name, num_labels, problem_type=PROBLEM_TYPE)
+# -----------------------------------------------------------------------------------
 
 from flwr.server.strategy import FedAvg
 
@@ -40,7 +48,7 @@ PFL_STATE = {
     "s": None,               # fixed sign vector over attacked coords (torch +/-1)
     "c": None,               # scaling factor c_t (init from config pfl_c0)
     "beta": 0.7,             # multiplicative decay when hypothesis test fails
-    "e": 50,                 # window length (rounds) for binomial test
+    "e": 50,                 # window length (rounds) for the binomial test
     "min_c": 0.5,            # lower bound on c_t
     "k_prev": None,          # previous malicious k^{t-1} (pre-sign)
     "dim": None,             # attacked dimension
@@ -186,14 +194,36 @@ class DeterministicClientSelectionMixin:
 
     # ---------------------------------------------------------------------------------------------------------------------------- #
 
+
     def configure_evaluate(self, server_round, parameters, client_manager):
+        # --- NEW: evaluate only in the last K rounds of every W-round window ---
+        cfg = globals().get("Config_Store", {}) or {}
+
+        W = int(cfg.get("eval_window_rounds", 100))         # every 100 rounds
+        K = int(cfg.get("eval_last_k_in_window", 10))       # last 10 rounds
+
+        # Optional: if you have total rounds, handle the last (possibly partial) window nicely
+        total_rounds = int(cfg.get("num-server-rounds", 0))
+
+        if W > 0 and K > 0:
+            if total_rounds > 0:
+                # end of the current window, capped by total_rounds
+                window_end = min(((server_round - 1) // W + 1) * W, total_rounds)
+                window_start = max(1, window_end - K + 1)
+                if server_round < window_start or server_round > window_end:
+                    return []
+            else:
+                # fallback: pure periodic windows of size W
+                pos = ((server_round - 1) % W) + 1  # 1..W
+                if pos <= (W - K):
+                    return []
+
         # Set a deterministic seed based on round number
         random.seed(42 + server_round)
 
         fraction_evaluate = self.fraction_evaluate
 
-        # available_clients = list(client_manager.clients)
-        available_clients = list(client_manager.all().values()) 
+        available_clients = list(client_manager.all().values())
         num_clients = min(len(available_clients), int(self.fraction_evaluate * len(available_clients)))
 
         selected_clients = random.sample(available_clients, num_clients)
@@ -201,50 +231,150 @@ class DeterministicClientSelectionMixin:
         # Print selected client IDs
         indexes = [available_clients.index(c) for c in selected_clients]
 
+        global CURRENT_EVAL_ROUND
+        CURRENT_EVAL_ROUND = server_round
+
         evaluate_ins = EvaluateIns(parameters, config={})
         return [(client, evaluate_ins) for client in selected_clients]
+
 
 # ====================================================================================================================================================== #
 
 def aggregate_evaluate(metrics):
-    """Aggregate evaluation results, keep a rolling last-10 average, and
-    every 100 rounds store that average for final reporting."""
-    # Globals already used elsewhere
-    global recent_accuracies
-    # New lightweight globals (lazy init so no top-level edits needed)
-    global avg10_blocks, _eval_round_count
-    if "avg10_blocks" not in globals():
-        avg10_blocks = []            # last-10 avg captured at rounds 100, 200, 300, ...
-    if "_eval_round_count" not in globals():
-        _eval_round_count = 0        # counts how many times this function has run
+    """Aggregate evaluation results.
 
-    # -------------------------------------------------------------------
-    accuracy_scores = [m["accuracy"] for _, m in metrics if "accuracy" in m]
-    avg_accuracy = sum(accuracy_scores) / len(accuracy_scores) if accuracy_scores else 0.0
+    - seq_cls: averages accuracy (and loss if provided), keeps rolling last-10 accuracy.
+    - qa: averages F1 / Exact Match (and loss), keeps rolling last-10 F1.
+    """
+    global recent_accuracies
+    global avg10_blocks
+    global window_summaries
+
+    global eval_history
+    if "eval_history" not in globals():
+        eval_history = []
+
+    if "avg10_blocks" not in globals():
+        avg10_blocks = []
+    if "window_summaries" not in globals():
+        window_summaries = []
+    if "recent_accuracies" not in globals():
+        recent_accuracies = []
+
+    # Read evaluation window config (defaults match your gating in configure_evaluate)
+    cfg = globals().get("Config_Store", {}) or {}
+    W = int(cfg.get("eval_window_rounds", 100))
+    K = int(cfg.get("eval_last_k_in_window", 10))
+    total_rounds = int(cfg.get("num-server-rounds", 0))
+    # Rolling average length (defaults to K; can be overridden by rolling_avg_k)
+    rolling_k = int(cfg.get("rolling_avg_k", K if K > 0 else 10))
+
+    # Detect QA vs classification from reported metrics
+    is_qa = any(("f1" in m or "exact_match" in m) for _, m in metrics)
 
     loss_scores = [m["loss"] for _, m in metrics if "loss" in m]
     avg_loss = sum(loss_scores) / len(loss_scores) if loss_scores else 0.0
 
-    recent_accuracies.append(avg_accuracy)
-    if len(recent_accuracies) > 10:
-        recent_accuracies.pop(0)
+    if is_qa:
+        f1_scores = [m["f1"] for _, m in metrics if "f1" in m]
+        em_scores = [m["exact_match"] for _, m in metrics if "exact_match" in m]
+        avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+        avg_em = sum(em_scores) / len(em_scores) if em_scores else 0.0
 
+        recent_accuracies.append(avg_f1)
+        if len(recent_accuracies) > rolling_k:
+            recent_accuracies.pop(0)
+        recent_avg = sum(recent_accuracies) / len(recent_accuracies)
+
+        round_num = globals().get("CURRENT_EVAL_ROUND", None)
+        eval_history.append({
+            "round": int(round_num) if round_num is not None else None,
+            "avg_loss": float(avg_loss),
+            "avg_f1": float(avg_f1),
+            "avg_em": float(avg_em),
+            "rolling_avg_f1": float(recent_avg),
+        })
+
+        summary = f"[SUMMARY] Average F1: {avg_f1:.4f} | Average EM: {avg_em:.4f}"
+        print(summary)
+        print(f"[INFO]    Rolling Avg F1 (Last {len(recent_accuracies)} Rounds): {recent_avg:.4f}")
+
+        with open("results.txt", "a") as file:
+            file.write(summary + "\n")
+            if avg_loss:
+                file.write(f"[INFO]    Average loss: {avg_loss:.6f}\n")
+            file.write(f"[INFO]    Rolling Avg F1 (Last {len(recent_accuracies)} Rounds): {recent_avg:.4f}\n")
+
+        # Record one summary per window (e.g., at rounds 100/200/300/...)
+        round_num = globals().get("CURRENT_EVAL_ROUND", None)
+        if round_num is not None and W > 0:
+            r = int(round_num)
+            window_end = min(((r - 1) // W + 1) * W, total_rounds) if total_rounds > 0 else (((r - 1) // W + 1) * W)
+            if r == int(window_end):
+                # True window start (handles partial last window when total_rounds is not a multiple of W)
+                window_start = ((int(window_end) - 1) // W) * W + 1
+                window_summaries.append({
+                    "window_start": window_start,
+                    "window_end": int(window_end),
+                    "metric": "f1",
+                    "rolling_k": int(len(recent_accuracies)),
+                    "value": float(recent_avg),
+                })
+                avg10_blocks.append(float(recent_avg))
+
+        out = {"f1": avg_f1, "exact_match": avg_em}
+        if avg_loss:
+            out["loss"] = avg_loss
+        return out
+
+    # ---------------- seq_cls ----------------
+    accuracy_scores = [m["accuracy"] for _, m in metrics if "accuracy" in m]
+    avg_accuracy = sum(accuracy_scores) / len(accuracy_scores) if accuracy_scores else 0.0
+
+    recent_accuracies.append(avg_accuracy)
+    if len(recent_accuracies) > rolling_k:
+        recent_accuracies.pop(0)
     recent_avg = sum(recent_accuracies) / len(recent_accuracies)
-    # -------------------------------------------------------------------
+
+    round_num = globals().get("CURRENT_EVAL_ROUND", None)
+    eval_history.append({
+        "round": int(round_num) if round_num is not None else None,
+        "avg_loss": float(avg_loss),
+        "avg_accuracy": float(avg_accuracy),
+        "rolling_avg_accuracy": float(recent_avg),
+    })
+
     summary = f"[SUMMARY] Average accuracy: {avg_accuracy:.4f}"
     print(summary)
     print(f"[INFO]    Rolling Avg Accuracy (Last {len(recent_accuracies)} Rounds): {recent_avg:.4f}")
 
     with open("results.txt", "a") as file:
         file.write(summary + "\n")
+        if avg_loss:
+            file.write(f"[INFO]    Average loss: {avg_loss:.6f}\n")
         file.write(f"[INFO]    Rolling Avg Accuracy (Last {len(recent_accuracies)} Rounds): {recent_avg:.4f}\n")
 
-    # ----- NEW: checkpoint the rolling last-10 avg every 100 rounds -----
-    _eval_round_count += 1
-    if _eval_round_count % 100 == 0:
-        avg10_blocks.append(float(recent_avg))
+    # Record one summary per window (e.g., at rounds 100/200/300/...)
+    round_num = globals().get("CURRENT_EVAL_ROUND", None)
+    if round_num is not None and W > 0:
+        r = int(round_num)
+        window_end = min(((r - 1) // W + 1) * W, total_rounds) if total_rounds > 0 else (((r - 1) // W + 1) * W)
+        if r == int(window_end):
+            # True window start (handles partial last window when total_rounds is not a multiple of W)
+            window_start = ((int(window_end) - 1) // W) * W + 1
+            window_summaries.append({
+                "window_start": window_start,
+                "window_end": int(window_end),
+                "metric": "accuracy",
+                "rolling_k": int(len(recent_accuracies)),
+                "value": float(recent_avg),
+            })
+            avg10_blocks.append(float(recent_avg))
 
-    return {"accuracy": avg_accuracy}
+    out = {"accuracy": avg_accuracy}
+    if avg_loss:
+        out["loss"] = avg_loss
+    return out
 
 # ====================================================================================================================================================== #
 
@@ -280,22 +410,49 @@ def print_final_results():
     lines.append(f"Orthogonality regularization: {cfg.get('use_ortho_loss', 'N/A')}")
     lines.append("")
 
-    # Prefer the stored checkpoints; otherwise, fall back to your original one-line summary.
-    if "avg10_blocks" in globals() and avg10_blocks:
-        lines.append("[FINAL] Last-10 Accuracy at each 100-round checkpoint")
-        for i, val in enumerate(avg10_blocks, start=1):
-            end = i * 100
-            start = end - 99
-            lines.append(f"  Rounds {start:>4}-{end:>4}: {val:.4f}")
+    # --- Per-round aggregated metrics ---
+    if "eval_history" in globals() and eval_history:
+        lines.append("[PER-ROUND AGGREGATED METRICS]")
+        for row in eval_history:
+            lines.append(str(row))
         lines.append("")
-    elif len(recent_accuracies) >= 10:
-        last_10 = recent_accuracies[-10:]
-        recent_avg = sum(last_10) / len(last_10)
-        lines.append(f"[FINAL] Rolling Avg Accuracy (Last 10 Rounds): {recent_avg:.4f}")
+
+    # --- Window-level summaries (one line per window) ---
+    W = int(cfg.get("eval_window_rounds", 100))
+    K = int(cfg.get("eval_last_k_in_window", 10))
+    rolling_k = int(cfg.get("rolling_avg_k", K if K > 0 else 10))
+
+    if "window_summaries" in globals() and window_summaries:
+        lines.append("[FINAL] Window rolling averages")
+        for ws in sorted(window_summaries, key=lambda x: int(x.get("window_end", 0) or 0)):
+            w_start = int(ws.get("window_start", 1) or 1)
+            w_end = int(ws.get("window_end", 0) or 0)
+            k_used = int(ws.get("rolling_k", rolling_k) or rolling_k)
+            val = float(ws.get("value", 0.0) or 0.0)
+            metric = (ws.get("metric") or "").lower()
+
+            if metric == "f1":
+                lines.append(f"[FINAL][Rounds {w_start}-{w_end}] Rolling Avg F1 (Last {k_used} Rounds): {val:.4f}")
+            else:
+                lines.append(f"[FINAL][Rounds {w_start}-{w_end}] Rolling Avg Accuracy (Last {k_used} Rounds): {val:.4f}")
         lines.append("")
     else:
-        lines.append("[FINAL] Not enough rounds to compute last-10 average.")
-        lines.append("")
+        # Fallback: print only the most recent rolling average
+        is_qa_final = False
+        if "eval_history" in globals() and eval_history:
+            is_qa_final = any(("avg_f1" in r) for r in eval_history)
+
+        if len(recent_accuracies) >= 1:
+            last_k = recent_accuracies[-min(len(recent_accuracies), rolling_k):]
+            recent_avg = sum(last_k) / len(last_k)
+            if is_qa_final:
+                lines.append(f"[FINAL] Rolling Avg F1 (Last {len(last_k)} Rounds): {recent_avg:.4f}")
+            else:
+                lines.append(f"[FINAL] Rolling Avg Accuracy (Last {len(last_k)} Rounds): {recent_avg:.4f}")
+            lines.append("")
+        else:
+            lines.append("[FINAL] No evaluation rounds were recorded.")
+            lines.append("")
 
     # Print to console (keeps your current behavior)
     print("\n".join(lines))
@@ -429,7 +586,7 @@ class _SameRoundForgeMixin:
             lora_idx = getattr(self, "lora_indices", None)
             if not lora_idx:
                 from LoRA_Sec.task import get_model
-                param_names = list(get_model(self.model_name, self.num_labels).state_dict().keys())
+                param_names = list(get_model_pt(self.model_name, self.num_labels).state_dict().keys())
                 lora_idx = [i for i, n in enumerate(param_names) if ("lora_A" in n or "lora_B" in n)]
                 self.lora_indices = lora_idx
 
@@ -531,7 +688,7 @@ class _PoisonedFLForgeMixin:
         lora_idx = getattr(self, "lora_indices", None)
         if not lora_idx:
             from LoRA_Sec.task import get_model
-            net = get_model(self.model_name, self.num_labels)
+            net = get_model_pt(self.model_name, self.num_labels)
             include_cls = bool(getattr(self, "pfl_include_classifier", False))
             lora_idx = _pfl_target_indices(net, include_cls)
             self.lora_indices = lora_idx
@@ -692,7 +849,7 @@ class ORLA(_SameRoundForgeMixin, _PoisonedFLForgeMixin, DeterministicClientSelec
         if not results:
             return None, {}
 
-        param_names = list(get_model(self.model_name, self.num_labels).state_dict().keys())
+        param_names = list(get_model_pt(self.model_name, self.num_labels).state_dict().keys())
 
         # Compute orthogonality score for each client
         client_scores = []
@@ -982,8 +1139,12 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
 
         if context is None:
             raise ValueError("Context is required.")
-    
+
         self.model_name = context.run_config["model-name"]
+
+        global PROBLEM_TYPE
+        PROBLEM_TYPE = str(context.run_config.get("problem_type", "seq_cls")).lower()
+
         self.dataset_name = context.run_config["dataset_name"]
         self.num_labels = int(context.run_config["num_labels"])
 
@@ -992,8 +1153,8 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
         self.trusted_loader = self._load_fltrust_data(
             dataset_name=self.dataset_name,
             model_name=self.model_name,
-            num_samples=100,  
-            seed=42           
+            num_samples=100,
+            seed=42
         )
 
     # ------------------------------------------------------------------------------------------------------------- #
@@ -1096,7 +1257,7 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
 
     # ------------------------------------------------------------------------------------------------------------- #
 
-    def get_server_trusted_update(self, model_name: str, dataset_name: str, num_samples: int = 500, seed: int = 42, num_labels: int = 2,
+    def get_server_trusted_update(self, model_name: str, dataset_name: str, num_samples: int = 100, seed: int = 42, num_labels: int = 2,
        ) -> List[np.ndarray]:
         """
         Compute the trusted server update g_s for FLTrust.
@@ -1111,7 +1272,7 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
 
         # ---------------------- Build model and load global params --------------------------
 
-        model = get_model(model_name, num_labels)
+        model = get_model_pt(model_name, num_labels)
 
         # Load current global LoRA/full parameters if available
         if self.base_params is not None:
@@ -1182,37 +1343,408 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
     # ------------------------------------------------------------------------------------------------------------- #
 
     def _load_fltrust_data(self, dataset_name: str, model_name: str, num_samples: int, seed: int):
+        """Build the trusted/root DataLoader for FLTrust.
+
+        For seq_cls tasks we sample from the training split using Dirichlet(label) sampling.
+        For extractive QA we support:
+          - SQuAD v1.1
+          - NewsQA
+          - HotpotQA distractor / extractive subset
+        For multiple-choice QA we support:
+          - SWAG
+          - PIQA
+
+        In the extractive-QA case we convert the raw dataset into the same SQuAD-style schema
+        expected by the existing QA tokenization code: {id, question, context, answers}.
+        """
 
         from torch.utils.data import DataLoader
         from datasets import load_dataset
-        from transformers import AutoTokenizer, DataCollatorWithPadding
+        from transformers import AutoTokenizer, DataCollatorWithPadding, DefaultDataCollator, DataCollatorForMultipleChoice
 
-        if dataset_name == "IMDB":
-            raw_dataset = load_dataset("stanfordnlp/imdb", split="train")
-        elif dataset_name == "Yelp":
-            raw_dataset = load_dataset("yelp_review_full", split="train")
-        elif dataset_name == "GoEmotions":
-            raw_dataset = load_dataset("go_emotions", "simplified", split="train")
-            raw_dataset = raw_dataset.map(lambda x: {"label": x["labels"][0] if x["labels"] else -1})
-            raw_dataset = raw_dataset.remove_columns("labels")
-        elif dataset_name == "DBPedia":
-            raw_dataset = load_dataset("dbpedia_14", split="train")
-            # fuse and drop
-            raw_dataset = raw_dataset.map(lambda ex: {
-                "text": (ex.get("title", "") + " " + ex.get("content", "")).strip()
-            })
-            raw_dataset = raw_dataset.remove_columns([c for c in ["title", "content"] if c in raw_dataset.column_names])
+        # Decide task mode
+        ds_name_l = str(dataset_name).lower()
+        problem_type = str(globals().get("PROBLEM_TYPE", "seq_cls")).lower()
+        is_qa = (problem_type == "qa") or ("squad" in ds_name_l) or ("newsqa" in ds_name_l) or ("hotpot" in ds_name_l)
+        is_mcqa = (problem_type == "mc_qa") or (ds_name_l in {"swag", "piqa"})
+
+        # ----------------------------- Load raw dataset ----------------------------- #
+        if is_qa:
+            import re
+
+            q_words = ("what", "who", "when", "where", "why", "how", "which")
+
+            def _q_type(q: str) -> int:
+                q0 = (q or "").strip().lower()
+                m = re.match(r"[a-z]+", q0)
+                w = m.group(0) if m else ""
+                try:
+                    return q_words.index(w)  # 0..6
+                except ValueError:
+                    return len(q_words)      # 7 -> other
+
+            if "hotpot" in ds_name_l:
+                raw_dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split="train")
+
+                hotpot_type_map = {"comparison": 0, "bridge": 1}
+
+                def _find_span(text: str, answer: str):
+                    if not text or not answer:
+                        return None
+                    idx = text.find(answer)
+                    if idx >= 0:
+                        return idx, idx + len(answer)
+                    m = re.search(re.escape(answer), text, flags=re.IGNORECASE)
+                    if m is not None:
+                        return m.start(), m.end()
+                    return None
+
+                def _convert_hotpot_example(ex):
+                    answer = str(ex.get("answer", "") or "").strip()
+                    if answer.lower() in {"", "yes", "no"}:
+                        return {
+                            "context": "",
+                            "answers": {"text": [], "answer_start": []},
+                            "label": -1,
+                        }
+
+                    context_obj = ex.get("context") or {}
+                    titles = context_obj.get("title", []) or []
+                    sentences_per_title = context_obj.get("sentences", []) or []
+
+                    supporting = ex.get("supporting_facts") or {}
+                    support_keys = {
+                        (str(t), int(sid))
+                        for t, sid in zip(supporting.get("title", []) or [], supporting.get("sent_id", []) or [])
+                    }
+
+                    support_sents = []
+                    other_sents = []
+                    for title, sent_list in zip(titles, sentences_per_title):
+                        title = str(title)
+                        for sid, sent in enumerate(sent_list or []):
+                            sent = str(sent or "").strip()
+                            if not sent:
+                                continue
+                            if (title, sid) in support_keys:
+                                support_sents.append(sent)
+                            else:
+                                other_sents.append(sent)
+
+                    context = " ".join(support_sents + other_sents).strip()
+                    span = _find_span(context, answer)
+                    if span is None:
+                        return {
+                            "context": "",
+                            "answers": {"text": [], "answer_start": []},
+                            "label": -1,
+                        }
+
+                    start, end = span
+                    matched_text = context[start:end]
+                    hotpot_type = str(ex.get("type", "") or "").strip().lower()
+                    label = 2 * _q_type(ex.get("question", "")) + hotpot_type_map.get(hotpot_type, 0)
+
+                    return {
+                        "context": context,
+                        "answers": {"text": [matched_text], "answer_start": [int(start)]},
+                        "label": int(label),
+                    }
+
+                raw_dataset = raw_dataset.map(_convert_hotpot_example)
+                raw_dataset = raw_dataset.filter(lambda ex: int(ex["label"]) >= 0)
+                keep_cols = {"id", "question", "context", "answers", "label"}
+                drop_cols = [c for c in raw_dataset.column_names if c not in keep_cols]
+                if drop_cols:
+                    raw_dataset = raw_dataset.remove_columns(drop_cols)
+
+            elif "newsqa" in ds_name_l:
+                raw_dataset = _get_newsqa_train_dataset()
+
+            else:
+                # Hugging Face dataset id "squad" corresponds to SQuAD v1.1 (extractive QA)
+                raw_dataset = load_dataset("squad", split="train")
+
+                # Create a pseudo-label based on question type (first wh-word), matching task.py
+                def _add_label(batch):
+                    labels = []
+                    for q in batch["question"]:
+                        labels.append(_q_type(q))
+                    return {"label": labels}
+
+                raw_dataset = raw_dataset.map(_add_label, batched=True)
+
+        elif is_mcqa:
+            def _swag_stem_type(sent2: str) -> int:
+                import re
+
+                wh_words = ("what", "why", "how", "when", "where", "who", "which")
+                aux_words = {
+                    "is", "are", "was", "were", "do", "does", "did", "can", "could",
+                    "would", "should", "will", "may", "might", "must", "has", "have", "had",
+                }
+
+                text = (sent2 or "").strip().lower()
+                m = re.match(r"[a-z]+", text)
+                first = m.group(0) if m else ""
+                if first in wh_words:
+                    return wh_words.index(first)
+                if first in aux_words:
+                    return len(wh_words)
+                return len(wh_words) + 1
+
+            def _piqa_goal_intent(goal: str) -> int:
+                text = (goal or "").strip().lower()
+
+                keyword_groups = [
+                    ("clean_wash", ("clean", "wash", "wipe", "dry", "rinse", "scrub", "polish")),
+                    ("fix_repair", ("fix", "repair", "mend", "patch", "restore")),
+                    ("open_close", ("open", "close", "shut", "lock", "unlock", "seal", "unseal")),
+                    ("move_carry", ("carry", "move", "transport", "lift", "pull", "push", "drag", "load", "unload")),
+                    ("cook_food", ("cook", "bake", "boil", "fry", "grill", "heat", "eat", "drink")),
+                    ("cut_break", ("cut", "slice", "break", "tear", "crack", "crush", "chop")),
+                    ("attach_connect", ("attach", "connect", "tie", "glue", "tape", "fasten", "hang", "mount", "install")),
+                ]
+
+                for idx, (_name, words) in enumerate(keyword_groups):
+                    if any(word in text for word in words):
+                        return idx
+                return len(keyword_groups)
+
+            if dataset_name in ["SWAG", "swag"]:
+                raw_dataset = load_dataset("swag", "regular", split="train")
+
+                raw_dataset = raw_dataset.rename_column("label", "mc_label")
+                pseudo_labels = [int(_swag_stem_type(x)) for x in raw_dataset["sent2"]]
+                raw_dataset = raw_dataset.add_column("label", pseudo_labels)
+
+                keep_cols = {"sent1", "sent2", "ending0", "ending1", "ending2", "ending3", "label", "mc_label"}
+                drop_cols = [c for c in raw_dataset.column_names if c not in keep_cols]
+                if drop_cols:
+                    raw_dataset = raw_dataset.remove_columns(drop_cols)
+
+            elif dataset_name in ["PIQA", "piqa"]:
+                raw_dataset = load_dataset("ybisk/piqa", split="train")
+
+                raw_dataset = raw_dataset.rename_column("label", "mc_label")
+                pseudo_labels = [int(_piqa_goal_intent(x)) for x in raw_dataset["goal"]]
+                raw_dataset = raw_dataset.add_column("label", pseudo_labels)
+
+                keep_cols = {"goal", "sol1", "sol2", "label", "mc_label"}
+                drop_cols = [c for c in raw_dataset.column_names if c not in keep_cols]
+                if drop_cols:
+                    raw_dataset = raw_dataset.remove_columns(drop_cols)
+
+            else:
+                raise ValueError(f"Unsupported multiple-choice QA dataset: {dataset_name}")
 
         else:
-            raise ValueError(f"Unsupported dataset: {dataset_name}")
+            raw_dataset = _get_seqcls_train_dataset(dataset_name, number_of_samples=None)
 
-        raw_dataset = raw_dataset.shuffle(seed=seed)
-        subset = raw_dataset.select(range(num_samples))
+        
+        # -------------------- Dirichlet(label) sampling for trusted/root set (with min-per-class) --------------------
+        
+        dirichlet_alpha = 0.5
+        min_per_class = 5
 
+        raw_dataset = raw_dataset.shuffle()
+
+        rng = np.random.default_rng()    #  rng = np.random.default_rng(seed)
+
+        # Collect label values
+        labels = np.array(raw_dataset["label"], dtype=int)
+
+        # Keep only valid labels (ignore -1 if any)
+        valid_mask = labels >= 0
+        valid_indices = np.where(valid_mask)[0]
+        labels_valid = labels[valid_mask]
+
+        classes = np.unique(labels_valid)
+        num_classes = len(classes)
+        if num_classes == 0:
+            raise ValueError("Trusted/root set sampling failed: no valid labels found.")
+
+        # Build index list per class
+        indices_by_class = {
+            c: valid_indices[np.where(labels_valid == c)[0]].tolist()
+            for c in classes
+        }
+
+        # Dirichlet proportions over classes (alpha=5 => near-IID-ish)
+        alpha_vec = np.ones(num_classes, dtype=float) * float(dirichlet_alpha)
+        proportions = rng.dirichlet(alpha_vec)
+
+        # --- Enforce a minimum per class ---
+        min_per_class = int(min_per_class)
+        required = min_per_class * num_classes
+        if required > num_samples:
+            raise ValueError(
+                f"min_per_class={min_per_class} too large for num_samples={num_samples} "
+                f"and num_classes={num_classes}"
+            )
+
+        # Allocate counts: start with minimum, then distribute remaining via multinomial
+        counts = np.full(num_classes, min_per_class, dtype=int)
+        remaining = num_samples - required
+        if remaining > 0:
+            counts += rng.multinomial(remaining, proportions)
+
+        # Sample without replacement per class
+        chosen = []
+        for c, k in zip(classes, counts):
+            pool = indices_by_class[c]
+            if len(pool) == 0 or k <= 0:
+                continue
+            k_eff = min(int(k), len(pool))
+            chosen.extend(rng.choice(pool, size=k_eff, replace=False).tolist())
+
+        # If we picked fewer than num_samples (due to small class pools), top up uniformly from remaining
+        if len(chosen) < num_samples:
+            remaining_pool = list(set(valid_indices.tolist()) - set(chosen))
+            if len(remaining_pool) > 0:
+                extra = rng.choice(
+                    remaining_pool,
+                    size=min(num_samples - len(chosen), len(remaining_pool)),
+                    replace=False,
+                ).tolist()
+                chosen.extend(extra)
+
+        # Final subset: deterministic ordering, exact size
+        chosen = sorted(chosen[:num_samples])
+        subset = raw_dataset.select(chosen)
+        # -------------------------------------------------------------------------------------------------------------
+
+        # ---------------------------- Tokenize + DataLoader ---------------------------- #
         tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=512)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
 
+        if is_qa:
+            # Build train features with start/end positions so loss is defined
+            max_length = 384
+            doc_stride = 128
+
+            def _prepare_train_features_squad(examples):
+                questions = [q.lstrip() for q in examples["question"]]
+                tokenized = tokenizer(
+                    questions,
+                    examples["context"],
+                    truncation="only_second",
+                    max_length=max_length,
+                    stride=doc_stride,
+                    return_overflowing_tokens=True,
+                    return_offsets_mapping=True,
+                    padding="max_length",
+                )
+
+                sample_mapping = tokenized.pop("overflow_to_sample_mapping")
+                offset_mapping = tokenized.pop("offset_mapping")
+
+                start_positions = []
+                end_positions = []
+
+                for i, offsets in enumerate(offset_mapping):
+                    input_ids = tokenized["input_ids"][i]
+                    cls_index = input_ids.index(tokenizer.cls_token_id)
+
+                    seq_ids = tokenized.sequence_ids(i)
+                    sample_index = sample_mapping[i]
+                    answers = examples["answers"][sample_index]
+
+                    if len(answers.get("answer_start", [])) == 0:
+                        start_positions.append(cls_index)
+                        end_positions.append(cls_index)
+                        continue
+
+                    start_char = answers["answer_start"][0]
+                    end_char = start_char + len(answers["text"][0])
+
+                    token_start_index = 0
+                    while seq_ids[token_start_index] != 1:
+                        token_start_index += 1
+                    token_end_index = len(input_ids) - 1
+                    while seq_ids[token_end_index] != 1:
+                        token_end_index -= 1
+
+                    if not (
+                        offsets[token_start_index][0] <= start_char
+                        and offsets[token_end_index][1] >= end_char
+                    ):
+                        start_positions.append(cls_index)
+                        end_positions.append(cls_index)
+                        continue
+
+                    while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
+                        token_start_index += 1
+                    start_positions.append(token_start_index - 1)
+
+                    while offsets[token_end_index][1] >= end_char:
+                        token_end_index -= 1
+                    end_positions.append(token_end_index + 1)
+
+                tokenized["start_positions"] = start_positions
+                tokenized["end_positions"] = end_positions
+                return tokenized
+
+            subset = subset.map(
+                _prepare_train_features_squad,
+                batched=True,
+                remove_columns=subset.column_names,
+            )
+
+            collator = DefaultDataCollator()
+            loader = DataLoader(subset, batch_size=8, shuffle=False, collate_fn=collator)
+            return loader
+
+        if is_mcqa:
+            def _prepare_swag_features(examples):
+                ending_names = ["ending0", "ending1", "ending2", "ending3"]
+                first_sentences = [[context] * 4 for context in examples["sent1"]]
+                question_headers = examples["sent2"]
+                second_sentences = [
+                    [f"{header} {examples[end][i]}" for end in ending_names] for i, header in enumerate(question_headers)
+                ]
+                first_sentences = sum(first_sentences, [])
+                second_sentences = sum(second_sentences, [])
+                tokenized_examples = tokenizer(first_sentences, second_sentences, truncation=True)
+                out = {k: [v[i: i + 4] for i in range(0, len(v), 4)] for k, v in tokenized_examples.items()}
+                if "mc_label" in examples:
+                    out["label"] = examples["mc_label"]
+                elif "label" in examples:
+                    out["label"] = examples["label"]
+                return out
+
+            def _prepare_piqa_features(examples):
+                first_sentences = [[goal, goal] for goal in examples["goal"]]
+                second_sentences = [[examples["sol1"][i], examples["sol2"][i]] for i in range(len(examples["goal"]))]
+                first_sentences = sum(first_sentences, [])
+                second_sentences = sum(second_sentences, [])
+                tokenized_examples = tokenizer(first_sentences, second_sentences, truncation=True)
+                out = {k: [v[i: i + 2] for i in range(0, len(v), 2)] for k, v in tokenized_examples.items()}
+                if "mc_label" in examples:
+                    out["label"] = examples["mc_label"]
+                elif "label" in examples:
+                    out["label"] = examples["label"]
+                return out
+
+            if dataset_name in ["SWAG", "swag"]:
+                preprocess_fn = _prepare_swag_features
+            elif dataset_name in ["PIQA", "piqa"]:
+                preprocess_fn = _prepare_piqa_features
+            else:
+                raise ValueError(f"Unsupported multiple-choice QA dataset: {dataset_name}")
+
+            subset = subset.map(
+                preprocess_fn,
+                batched=True,
+                remove_columns=subset.column_names,
+            )
+
+            collator = DataCollatorForMultipleChoice(tokenizer=tokenizer)
+            loader = DataLoader(subset, batch_size=8, shuffle=False, collate_fn=collator)
+            return loader
+
+        # ---------------------------- seq_cls pipeline ---------------------------- #
         def tokenize_fn(batch):
             return tokenizer(batch["text"], truncation=True, padding=True)
 
@@ -1308,13 +1840,14 @@ class DnC(_SameRoundForgeMixin, _PoisonedFLForgeMixin, DeterministicClientSelect
 
         principal_direction = vh[0]
 
-        # Step 3: Project updates onto principal direction
-        projections = update_matrix_reduced @ principal_direction
+        # Step 3: Project *centered* updates onto principal direction (paper: <x_i - mean, v>)
+        projections = X_centered @ principal_direction
+        scores = projections ** 2  # paper uses squared projection as outlier score
 
-        # Step 4: Remove top trim_ratio fraction of projections (assumed malicious)
-        num_trim = int(self.trim_ratio * len(projections))
-        indices_sorted = np.argsort(np.abs(projections))  # sort by magnitude of projection
-        reliable_indices = indices_sorted[:len(projections) - num_trim]
+        # Step 4: Remove top trim_ratio fraction of scores (assumed malicious)
+        num_trim = int(self.trim_ratio * len(scores))
+        indices_sorted = np.argsort(scores)  # keep smallest scores
+        reliable_indices = indices_sorted[:len(scores) - num_trim]
 
         # Step 5: Aggregate remaining updates
         selected_updates = [client_updates[i] for i in reliable_indices]
@@ -1379,181 +1912,6 @@ class IdealDefenseStrategy(DeterministicClientSelectionMixin, FedAvg):
 
 # ====================================================================================================================================================== #
 
-class FoolsGoldStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, DeterministicClientSelectionMixin, FedAvg):
-    """
-    FoolsGold aggregation for sybil-resistant FL.
-    - Maintains historical updates H_i per client on indicative features (classifier layer).
-    - Computes ST-weighted cosine similarities with pardoning, then per-client alphas via logit.
-    - Aggregates as w_t = w_{t-1} + sum_i alpha_i * (params_i - w_{t-1}).
-    Paper: Algorithm 1 (history, pardoning, logit). 
-    """
-
-    def __init__(self, *, model_name: str, num_labels: int, kappa: float = 1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.model_name = model_name
-        self.num_labels = int(num_labels)
-        self.kappa = float(kappa)
-
-        # Per-round state
-        self._hist = {}            # cid -> np.ndarray (historical vector on classifier dims)
-        self._st = None            # feature-importance weights over classifier dims
-        self._cls_idx = None       # indices in parameter list that belong to classifier
-        self._cls_shapes = None    # shapes of classifier tensors for re-shaping
-        self._cls_sizes = None     # flat sizes per classifier tensor
-
-    # ---------- helpers ----------
-    def _ensure_classifier_indices(self):
-        if self._cls_idx is not None:
-            return
-        names = list(get_model(self.model_name, self.num_labels).state_dict().keys())
-        self._cls_idx = [i for i, n in enumerate(names) if "classifier" in n]
-        if not self._cls_idx:
-            # Fallback: if no explicit classifier found, use last tensor as "output"
-            self._cls_idx = [len(names) - 1]
-        self._cls_shapes = []
-        self._cls_sizes = []
-        model_params = get_params(get_model(self.model_name, self.num_labels))
-        for i in self._cls_idx:
-            shp = model_params[i].shape
-            self._cls_shapes.append(shp)
-            self._cls_sizes.append(int(np.prod(shp)))
-
-    def _flatten_classifier(self, nds: List[np.ndarray]) -> np.ndarray:
-        self._ensure_classifier_indices()
-        parts = [nds[i].reshape(-1) for i in self._cls_idx]
-        return np.concatenate(parts).astype(np.float32, copy=False)
-
-    def _weighted_cosine(self, x: np.ndarray, y: np.ndarray, st: np.ndarray) -> float:
-        # cosine
-        xw = st * x
-        yw = st * y
-        nx = np.linalg.norm(xw) + 1e-12
-        ny = np.linalg.norm(yw) + 1e-12
-        return float(np.dot(xw, yw) / (nx * ny))
-
-    def _make_ST_from_global(self, base_params: List[np.ndarray]) -> np.ndarray:
-        # Soft feature-importance: abs of classifier weights; normalized to [0,1]
-        flat_cls = self._flatten_classifier(base_params)
-        st = np.abs(flat_cls).astype(np.float32)
-        m = st.max() if st.size else 0.0
-        st = st / (m + 1e-12) if m > 0 else np.ones_like(st, dtype=np.float32)
-        return st
-
-    # ---------- main aggregation ----------
-    def aggregate_fit(
-        self,
-        server_round: int,
-        results: List[Tuple[ClientProxy, FitRes]],
-        failures: List[BaseException],
-    ) -> Optional[Tuple[Parameters, Dict[str, Scalar]]]:
-
-        # Keep your attack forgers active (NDSS'21 / PoisonedFL) so your simulations still work
-        self._maybe_forge_same_round(server_round, results)
-        self._maybe_forge_pfl(server_round, results)
-
-        if not results:
-            return None
-
-        # Need the just-broadcast model to compute deltas
-        global LAST_BROADCAST
-        if LAST_BROADCAST is None:
-            # Fallback to FedAvg on very first round
-            return super().aggregate_fit(server_round, results, failures)
-
-        base = LAST_BROADCAST
-        self._ensure_classifier_indices()
-
-        # Prepare ST (feature-importance) from current global model
-        self._st = self._make_ST_from_global(base)
-
-        # Build client deltas and update history on classifier dims
-        client_keys = []
-        deltas_full: List[List[np.ndarray]] = []
-        hist_now: Dict[str, np.ndarray] = {}
-
-        for idx, (client, fit_res) in enumerate(results):
-            cid = str(getattr(client, "cid", f"idx{idx}"))
-            w_i = parameters_to_ndarrays(fit_res.parameters)
-            # delta over full tensors (for final aggregation)
-            delta_i = [w_i[k] - base[k] for k in range(len(w_i))]
-            deltas_full.append(delta_i)
-
-            # historical vector only on classifier dims
-            di_cls = self._flatten_classifier(delta_i)  # Δ_i on classifier dims
-            prev = self._hist.get(cid)
-            hi = di_cls if prev is None else (prev + di_cls)
-            self._hist[cid] = hi
-            hist_now[cid] = hi
-            client_keys.append(cid)
-
-        n = len(client_keys)
-        if n == 1:
-            # Single client selected: just take its update
-            new_params = [base[k] + deltas_full[0][k] for k in range(len(base))]
-            result = (ndarrays_to_parameters(new_params), {})
-            self._pfl_after_aggregate_update(server_round, result)
-            return result
-
-        # Pairwise ST-weighted cosine similarities on histories (exclude self)
-        cs = np.zeros((n, n), dtype=np.float32)
-        for i in range(n):
-            hi = hist_now[client_keys[i]]
-            for j in range(n):
-                if i == j:
-                    continue
-                hj = hist_now[client_keys[j]]
-                cs[i, j] = self._weighted_cosine(hi, hj, self._st)
-
-        # v_i = max_j cs_ij (pre-pardoning)
-        v = cs.max(axis=1)
-
-        # Pardoning: if v_j > v_i then cs_ij *= v_i / v_j
-        # (avoid penalizing honest clients similar to stronger (more similar) sybils)
-        pardoned = cs.copy()
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-                if v[j] > v[i] and v[j] > 0:
-                    pardoned[i, j] *= (v[i] / (v[j] + 1e-12))
-
-        # alpha_i = 1 - max_j pardoned_ij
-        alpha = 1.0 - pardoned.max(axis=1)
-
-        # Normalize to [0,1] by dividing by max
-        amx = float(alpha.max())
-        if amx > 0:
-            alpha = alpha / amx
-        else:
-            alpha = np.ones_like(alpha, dtype=np.float32)
-
-        # Logit transform centered at 0.5: alpha = kappa * ( ln(alpha/(1-alpha)) + 0.5 )
-        eps = 1e-12
-        alpha = self.kappa * (np.log((alpha + eps) / (1.0 - alpha + eps)) + 0.5)
-
-        # Clip to [0,1] (per paper)
-        alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
-
-        # If everything got clipped to 0, fall back to uniform
-        if float(alpha.max()) == 0.0:
-            alpha = np.ones_like(alpha, dtype=np.float32)
-
-        # Aggregate as w_t = w_{t-1} + sum_i alpha_i * Δ_i
-        num_layers = len(base)
-        agg = [np.array(b, copy=True) for b in base]
-        for li in range(num_layers):
-            # weighted sum of deltas for layer li
-            acc = np.zeros_like(base[li])
-            for i in range(n):
-                acc += float(alpha[i]) * deltas_full[i][li]
-            agg[li] = base[li] + acc
-
-        result = (ndarrays_to_parameters(agg), {})
-        self._pfl_after_aggregate_update(server_round, result)
-        return result
-
-# ====================================================================================================================================================== #
-
 class FedDMCStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, DeterministicClientSelectionMixin, FedAvg):
     """
     FedDMC (Mu et al., TDSC 2024): PCA -> BTBCN (binary tree w/ noise pruning) -> SEDC (EMA trust).
@@ -1601,7 +1959,7 @@ class FedDMCStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, DeterministicC
         try:
             if self.lora_indices is None:
                 from LoRA_Sec.task import get_model
-                net = get_model(self.model_name, self.num_labels)
+                net = get_model_pt(self.model_name, self.num_labels)
                 # use your module-level helpers (not self.*)
                 idx = _pfl_target_indices(net, self.include_classifier)
                 self.lora_indices = idx
@@ -1792,7 +2150,7 @@ class ShieldFLStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministi
         if getattr(self, "use_lora_only", True):
             # Build and cache LoRA(+classifier) indices once
             if not hasattr(self, "_shield_idx") or self._shield_idx is None:
-                net = get_model(self.model_name, self.num_labels)
+                net = get_model_pt(self.model_name, self.num_labels)
                 self._shield_idx = _pfl_target_indices(net, getattr(self, "include_classifier", False))
             return _pfl_flat_from_indices(arrs, self._shield_idx).numpy().astype(np.float32, copy=False)
         # fallback: all params
@@ -1892,12 +2250,16 @@ def server_fn(context: Context) -> ServerAppComponents:
     global Config_Store
     Config_Store = dict(context.run_config)
 
+    # Ensure server uses the same problem_type as clients BEFORE building init params
+    global PROBLEM_TYPE
+    PROBLEM_TYPE = str(context.run_config.get("problem_type", "seq_cls")).lower()
+
     """Construct components for ServerApp using Krum strategy with logging."""
     num_rounds = context.run_config["num-server-rounds"]
     config = ServerConfig(num_rounds=num_rounds)
 
     model_name = context.run_config["model-name"]
-    ndarrays = get_params(get_model(model_name , num_labels = int(context.run_config["num_labels"])))
+    ndarrays = get_params(get_model_pt(model_name , num_labels = int(context.run_config["num_labels"])))
     global_model_init = ndarrays_to_parameters(ndarrays)
 
 
@@ -2035,18 +2397,6 @@ def server_fn(context: Context) -> ServerAppComponents:
         )
 
 
-    elif context.run_config["strategy"] == "FoolsGold":
-        strategy = FoolsGoldStrategy(
-            model_name=model_name,
-            num_labels=int(context.run_config["num_labels"]),
-            kappa=float(context.run_config.get("strategy_parameter", 1.0)),  # use strategy_parameter as κ
-            fraction_fit=fraction_fit,
-            fraction_evaluate=fraction_evaluate,
-            initial_parameters=global_model_init,
-            evaluate_metrics_aggregation_fn=aggregate_evaluate,
-        )
-
-
     elif context.run_config["strategy"] == "FedDMC":
         strategy = FedDMCStrategy(
             context=context,
@@ -2085,7 +2435,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         strategy.model_name  = context.run_config["model-name"]
         strategy.num_labels  = int(context.run_config["num_labels"])
         # Pre-compute LoRA indices once
-        param_names = list(get_model(strategy.model_name, strategy.num_labels).state_dict().keys())
+        param_names = list(get_model_pt(strategy.model_name, strategy.num_labels).state_dict().keys())
         strategy.lora_indices = [i for i, n in enumerate(param_names) if ("lora_A" in n or "lora_B" in n)]
         # Optional: paper direction choice ("std" default, also accepts "uv" or "sgn")
         strategy.rp_mode = context.run_config.get("rp_mode", "std")
