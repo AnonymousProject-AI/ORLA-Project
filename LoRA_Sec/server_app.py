@@ -11,7 +11,7 @@ import numpy as np
 from flwr.server.client_proxy import ClientProxy
 from flwr.common import FitIns
 
-from LoRA_Sec.task import get_params, get_model, set_params, _get_newsqa_train_dataset, _get_seqcls_train_dataset
+from LoRA_Sec.task import get_params, get_model, set_params, _get_seqcls_train_dataset, DataCollatorForMultipleChoice
 
 # -------------------- Problem switch (seq_cls vs extractive QA) --------------------
 PROBLEM_TYPE = "seq_cls"
@@ -269,63 +269,9 @@ def aggregate_evaluate(metrics):
     # Rolling average length (defaults to K; can be overridden by rolling_avg_k)
     rolling_k = int(cfg.get("rolling_avg_k", K if K > 0 else 10))
 
-    # Detect QA vs classification from reported metrics
-    is_qa = any(("f1" in m or "exact_match" in m) for _, m in metrics)
-
     loss_scores = [m["loss"] for _, m in metrics if "loss" in m]
     avg_loss = sum(loss_scores) / len(loss_scores) if loss_scores else 0.0
 
-    if is_qa:
-        f1_scores = [m["f1"] for _, m in metrics if "f1" in m]
-        em_scores = [m["exact_match"] for _, m in metrics if "exact_match" in m]
-        avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
-        avg_em = sum(em_scores) / len(em_scores) if em_scores else 0.0
-
-        recent_accuracies.append(avg_f1)
-        if len(recent_accuracies) > rolling_k:
-            recent_accuracies.pop(0)
-        recent_avg = sum(recent_accuracies) / len(recent_accuracies)
-
-        round_num = globals().get("CURRENT_EVAL_ROUND", None)
-        eval_history.append({
-            "round": int(round_num) if round_num is not None else None,
-            "avg_loss": float(avg_loss),
-            "avg_f1": float(avg_f1),
-            "avg_em": float(avg_em),
-            "rolling_avg_f1": float(recent_avg),
-        })
-
-        summary = f"[SUMMARY] Average F1: {avg_f1:.4f} | Average EM: {avg_em:.4f}"
-        print(summary)
-        print(f"[INFO]    Rolling Avg F1 (Last {len(recent_accuracies)} Rounds): {recent_avg:.4f}")
-
-        with open("results.txt", "a") as file:
-            file.write(summary + "\n")
-            if avg_loss:
-                file.write(f"[INFO]    Average loss: {avg_loss:.6f}\n")
-            file.write(f"[INFO]    Rolling Avg F1 (Last {len(recent_accuracies)} Rounds): {recent_avg:.4f}\n")
-
-        # Record one summary per window (e.g., at rounds 100/200/300/...)
-        round_num = globals().get("CURRENT_EVAL_ROUND", None)
-        if round_num is not None and W > 0:
-            r = int(round_num)
-            window_end = min(((r - 1) // W + 1) * W, total_rounds) if total_rounds > 0 else (((r - 1) // W + 1) * W)
-            if r == int(window_end):
-                # True window start (handles partial last window when total_rounds is not a multiple of W)
-                window_start = ((int(window_end) - 1) // W) * W + 1
-                window_summaries.append({
-                    "window_start": window_start,
-                    "window_end": int(window_end),
-                    "metric": "f1",
-                    "rolling_k": int(len(recent_accuracies)),
-                    "value": float(recent_avg),
-                })
-                avg10_blocks.append(float(recent_avg))
-
-        out = {"f1": avg_f1, "exact_match": avg_em}
-        if avg_loss:
-            out["loss"] = avg_loss
-        return out
 
     # ---------------- seq_cls ----------------
     accuracy_scores = [m["accuracy"] for _, m in metrics if "accuracy" in m]
@@ -1346,135 +1292,23 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
         """Build the trusted/root DataLoader for FLTrust.
 
         For seq_cls tasks we sample from the training split using Dirichlet(label) sampling.
-        For extractive QA we support:
-          - SQuAD v1.1
-          - NewsQA
-          - HotpotQA distractor / extractive subset
         For multiple-choice QA we support:
           - SWAG
           - PIQA
-
-        In the extractive-QA case we convert the raw dataset into the same SQuAD-style schema
-        expected by the existing QA tokenization code: {id, question, context, answers}.
         """
 
         from torch.utils.data import DataLoader
         from datasets import load_dataset
-        from transformers import AutoTokenizer, DataCollatorWithPadding, DefaultDataCollator, DataCollatorForMultipleChoice
+        from transformers import AutoTokenizer, DataCollatorWithPadding
 
         # Decide task mode
         ds_name_l = str(dataset_name).lower()
         problem_type = str(globals().get("PROBLEM_TYPE", "seq_cls")).lower()
-        is_qa = (problem_type == "qa") or ("squad" in ds_name_l) or ("newsqa" in ds_name_l) or ("hotpot" in ds_name_l)
         is_mcqa = (problem_type == "mc_qa") or (ds_name_l in {"swag", "piqa"})
 
         # ----------------------------- Load raw dataset ----------------------------- #
-        if is_qa:
-            import re
 
-            q_words = ("what", "who", "when", "where", "why", "how", "which")
-
-            def _q_type(q: str) -> int:
-                q0 = (q or "").strip().lower()
-                m = re.match(r"[a-z]+", q0)
-                w = m.group(0) if m else ""
-                try:
-                    return q_words.index(w)  # 0..6
-                except ValueError:
-                    return len(q_words)      # 7 -> other
-
-            if "hotpot" in ds_name_l:
-                raw_dataset = load_dataset("hotpotqa/hotpot_qa", "distractor", split="train")
-
-                hotpot_type_map = {"comparison": 0, "bridge": 1}
-
-                def _find_span(text: str, answer: str):
-                    if not text or not answer:
-                        return None
-                    idx = text.find(answer)
-                    if idx >= 0:
-                        return idx, idx + len(answer)
-                    m = re.search(re.escape(answer), text, flags=re.IGNORECASE)
-                    if m is not None:
-                        return m.start(), m.end()
-                    return None
-
-                def _convert_hotpot_example(ex):
-                    answer = str(ex.get("answer", "") or "").strip()
-                    if answer.lower() in {"", "yes", "no"}:
-                        return {
-                            "context": "",
-                            "answers": {"text": [], "answer_start": []},
-                            "label": -1,
-                        }
-
-                    context_obj = ex.get("context") or {}
-                    titles = context_obj.get("title", []) or []
-                    sentences_per_title = context_obj.get("sentences", []) or []
-
-                    supporting = ex.get("supporting_facts") or {}
-                    support_keys = {
-                        (str(t), int(sid))
-                        for t, sid in zip(supporting.get("title", []) or [], supporting.get("sent_id", []) or [])
-                    }
-
-                    support_sents = []
-                    other_sents = []
-                    for title, sent_list in zip(titles, sentences_per_title):
-                        title = str(title)
-                        for sid, sent in enumerate(sent_list or []):
-                            sent = str(sent or "").strip()
-                            if not sent:
-                                continue
-                            if (title, sid) in support_keys:
-                                support_sents.append(sent)
-                            else:
-                                other_sents.append(sent)
-
-                    context = " ".join(support_sents + other_sents).strip()
-                    span = _find_span(context, answer)
-                    if span is None:
-                        return {
-                            "context": "",
-                            "answers": {"text": [], "answer_start": []},
-                            "label": -1,
-                        }
-
-                    start, end = span
-                    matched_text = context[start:end]
-                    hotpot_type = str(ex.get("type", "") or "").strip().lower()
-                    label = 2 * _q_type(ex.get("question", "")) + hotpot_type_map.get(hotpot_type, 0)
-
-                    return {
-                        "context": context,
-                        "answers": {"text": [matched_text], "answer_start": [int(start)]},
-                        "label": int(label),
-                    }
-
-                raw_dataset = raw_dataset.map(_convert_hotpot_example)
-                raw_dataset = raw_dataset.filter(lambda ex: int(ex["label"]) >= 0)
-                keep_cols = {"id", "question", "context", "answers", "label"}
-                drop_cols = [c for c in raw_dataset.column_names if c not in keep_cols]
-                if drop_cols:
-                    raw_dataset = raw_dataset.remove_columns(drop_cols)
-
-            elif "newsqa" in ds_name_l:
-                raw_dataset = _get_newsqa_train_dataset()
-
-            else:
-                # Hugging Face dataset id "squad" corresponds to SQuAD v1.1 (extractive QA)
-                raw_dataset = load_dataset("squad", split="train")
-
-                # Create a pseudo-label based on question type (first wh-word), matching task.py
-                def _add_label(batch):
-                    labels = []
-                    for q in batch["question"]:
-                        labels.append(_q_type(q))
-                    return {"label": labels}
-
-                raw_dataset = raw_dataset.map(_add_label, batched=True)
-
-        elif is_mcqa:
+        if is_mcqa:
             def _swag_stem_type(sent2: str) -> int:
                 import re
 
@@ -1618,83 +1452,6 @@ class FLTrustStrategy(_SameRoundForgeMixin, _PoisonedFLForgeMixin, Deterministic
         tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=512)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
-
-        if is_qa:
-            # Build train features with start/end positions so loss is defined
-            max_length = 384
-            doc_stride = 128
-
-            def _prepare_train_features_squad(examples):
-                questions = [q.lstrip() for q in examples["question"]]
-                tokenized = tokenizer(
-                    questions,
-                    examples["context"],
-                    truncation="only_second",
-                    max_length=max_length,
-                    stride=doc_stride,
-                    return_overflowing_tokens=True,
-                    return_offsets_mapping=True,
-                    padding="max_length",
-                )
-
-                sample_mapping = tokenized.pop("overflow_to_sample_mapping")
-                offset_mapping = tokenized.pop("offset_mapping")
-
-                start_positions = []
-                end_positions = []
-
-                for i, offsets in enumerate(offset_mapping):
-                    input_ids = tokenized["input_ids"][i]
-                    cls_index = input_ids.index(tokenizer.cls_token_id)
-
-                    seq_ids = tokenized.sequence_ids(i)
-                    sample_index = sample_mapping[i]
-                    answers = examples["answers"][sample_index]
-
-                    if len(answers.get("answer_start", [])) == 0:
-                        start_positions.append(cls_index)
-                        end_positions.append(cls_index)
-                        continue
-
-                    start_char = answers["answer_start"][0]
-                    end_char = start_char + len(answers["text"][0])
-
-                    token_start_index = 0
-                    while seq_ids[token_start_index] != 1:
-                        token_start_index += 1
-                    token_end_index = len(input_ids) - 1
-                    while seq_ids[token_end_index] != 1:
-                        token_end_index -= 1
-
-                    if not (
-                        offsets[token_start_index][0] <= start_char
-                        and offsets[token_end_index][1] >= end_char
-                    ):
-                        start_positions.append(cls_index)
-                        end_positions.append(cls_index)
-                        continue
-
-                    while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
-                        token_start_index += 1
-                    start_positions.append(token_start_index - 1)
-
-                    while offsets[token_end_index][1] >= end_char:
-                        token_end_index -= 1
-                    end_positions.append(token_end_index + 1)
-
-                tokenized["start_positions"] = start_positions
-                tokenized["end_positions"] = end_positions
-                return tokenized
-
-            subset = subset.map(
-                _prepare_train_features_squad,
-                batched=True,
-                remove_columns=subset.column_names,
-            )
-
-            collator = DefaultDataCollator()
-            loader = DataLoader(subset, batch_size=8, shuffle=False, collate_fn=collator)
-            return loader
 
         if is_mcqa:
             def _prepare_swag_features(examples):
